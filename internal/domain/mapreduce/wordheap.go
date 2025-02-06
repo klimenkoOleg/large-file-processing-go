@@ -4,7 +4,7 @@ import "container/heap"
 
 // Struct for word info storage
 type WordEntry struct {
-	word      *string
+	word      string
 	count     int
 	fileIndex int // Индекс файла, из которого взято слово
 }
@@ -21,7 +21,7 @@ func newWordHeap() *WordHeap {
 }
 
 func (h WordHeap) Len() int           { return len(h) }
-func (h WordHeap) Less(i, j int) bool { return *h[i].word < *h[j].word }
+func (h WordHeap) Less(i, j int) bool { return h[i].word < h[j].word }
 func (h WordHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
 
 func (h *WordHeap) Push(x interface{}) {
