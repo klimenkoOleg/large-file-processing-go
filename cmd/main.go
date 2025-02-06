@@ -13,6 +13,7 @@ func main() {
 	if err != nil {
 		panic(err)
 	}
+
 	n := 5
 	workers := 1
 	service := mapreduce.NewService(n, workers, l)
