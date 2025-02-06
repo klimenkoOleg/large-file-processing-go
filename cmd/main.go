@@ -14,7 +14,7 @@ func main() {
 		panic(err)
 	}
 
-	n := 5
+	n := 2
 	workers := 1
 	service := mapreduce.NewService(n, workers, l)
 	err = service.Do(context.Background(), "input.txt")

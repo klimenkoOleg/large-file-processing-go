@@ -28,8 +28,8 @@ type InputFile interface {
 }
 
 type OutputFile interface {
-	Close()
-	WriteLine(line string) error
+	Close() error
+	Write(line string) error
 }
 
 type StorageImpl struct {
@@ -129,12 +129,22 @@ func newOutputFile(fileName string) (*OutputFileImpl, error) {
 		nil
 }
 
-func (s *OutputFileImpl) Close() {
-	s.file.Close()
+func (s *OutputFileImpl) Close() error {
+	err := s.writer.Flush()
+	if err != nil {
+		return err
+	}
+	err = s.file.Close()
+	if err != nil {
+		return err
+	}
+
+	return nil
 }
 
-func (s *OutputFileImpl) WriteLine(line string) error {
-	_, err := fmt.Println(s.writer, line)
+func (s *OutputFileImpl) Write(line string) error {
+	//_, err := fmt.Println(s.writer, line)
+	_, err := s.writer.Write([]byte(line))
 	if err != nil {
 		return fmt.Errorf("write to file filed, error=%w", err)
 	}
@@ -148,8 +158,15 @@ func (s *Service) Do(ctx context.Context, inputFileName string) error {
 		return fmt.Errorf("map and shuffle stage failed, error=%w", err)
 	}
 
-	outputFileName := s.reduce(tempFiles)
-	os.Rename(outputFileName, "output.txt")
+	outputFileName, err := s.reduce(ctx, tempFiles)
+	if err != nil {
+		return fmt.Errorf("reduce stage failed, error=%w", err)
+	}
+
+	err = os.Rename(outputFileName, "output.txt")
+	if err != nil {
+		return fmt.Errorf("rename output file failed, error=%w", err)
+	}
 
 	return nil
 }
@@ -199,6 +216,15 @@ func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) ([]st
 		}
 	}
 
+	if len(wordCount) > 0 {
+		tempFile, err := s.shuffleAndSendToWorker(ctx, wordCount, fileIndex)
+		if err != nil {
+			return nil, fmt.Errorf("shuffleAndSendToWorker failed, error=%w", err)
+		}
+		tempFiles = append(tempFiles, tempFile)
+		clear(wordCount)
+	}
+
 	return tempFiles, nil
 }
 
@@ -214,7 +240,12 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 	if err != nil {
 		return "", fmt.Errorf("create temp file failed, error=%w", err)
 	}
-	defer writer.Close()
+	defer func() {
+		closeErr := writer.Close()
+		if closeErr != nil {
+			s.log.Error("Close temp file failed", zap.Error(err))
+		}
+	}()
 	// writer := bufio.NewWriter(file)
 
 	// Сортируем слова перед записью
@@ -222,7 +253,7 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 	for word := range wordCount {
 		words = append(words, word)
 	}
-	sort.Strings(words) // Лексикографическая сортировка
+	sort.Strings(words) // Лексикографическая сортировка, TODO: it requires extra space!
 
 	// Записываем в файл
 	for _, word := range words {
@@ -231,8 +262,8 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 			return "", fmt.Errorf("context cancelled, error if any=%w", ctx.Err())
 		default:
 		}
-		line := fmt.Sprintf("%s\t%d", word, wordCount[word])
-		err := writer.WriteLine(line)
+		line := fmt.Sprintf("%s\t%d\n", word, wordCount[word])
+		err := writer.Write(line)
 		if err != nil {
 			return "", fmt.Errorf("temp file write line failed, error=%w", err)
 		}
@@ -289,7 +320,10 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 	}
 	defer func() {
 		for _, f := range files {
-			f.Close()
+			closeErr := f.Close()
+			if closeErr != nil {
+				s.log.Error("Failed to close file", zap.Error(closeErr))
+			}
 		}
 	}()
 
@@ -297,7 +331,12 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 	if err != nil {
 		return fmt.Errorf("Failed to create output file in storage", zap.Error(err))
 	}
-	defer writer.Close()
+	defer func() {
+		closeErr := writer.Close()
+		if closeErr != nil {
+			s.log.Error("failed to close output file", zap.Error(closeErr))
+		}
+	}()
 
 	// Create min-heap of words
 	minHeap := newWordHeap()
@@ -306,7 +345,7 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 		if f.Scan() {
 			word, count, err := f.ReadMappedLine()
 			if err != nil {
-
+				return fmt.Errorf("Failed to read mapped line from file in storage", zap.Error(err))
 			}
 			heap.Push(minHeap, WordEntry{word: word, count: count, fileIndex: i})
 		}
@@ -323,7 +362,10 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 		} else {
 			if prevWord != "" {
 				line := fmt.Sprintf("%s\t%d\n", prevWord, totalCount)
-				writer.WriteLine(line)
+				err := writer.Write(line)
+				if err != nil {
+					return fmt.Errorf("temp file write line failed, error=%w", err)
+				}
 			}
 			prevWord = entry.word
 			totalCount = entry.count
@@ -340,35 +382,49 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 			}
 			heap.Push(minHeap, WordEntry{word: word, count: count, fileIndex: entry.fileIndex})
 		}
+	}
 
-		// Записываем последнее слово
-		if prevWord != "" {
-			line := fmt.Sprintf("%s\t%d\n", prevWord, totalCount)
-			err := writer.WriteLine(line)
-			if err != nil {
-				return fmt.Errorf("WriteLine failed, error=%w", err)
-			}
+	// Записываем последнее слово
+	if prevWord != "" {
+		line := fmt.Sprintf("%s\t%d\n", prevWord, totalCount)
+		err := writer.Write(line)
+		if err != nil {
+			return fmt.Errorf("Write failed, error=%w", err)
 		}
 	}
 
 	return nil
 }
 
-func (s *Service) reduce(tempFiles []string) string {
+func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error) {
 	for len(tempFiles) > 1 {
 		var newFiles []string
 		var wg sync.WaitGroup
 		mergeChan := make(chan string, len(tempFiles)/2)
 
+		outFileCounter := 0
 		for i := 0; i < len(tempFiles); i += 2 {
+			select {
+			case <-ctx.Done():
+				return "", fmt.Errorf("context cancelled, err if any=%w", ctx.Err())
+			default: // just continue
+			}
 			if i+1 < len(tempFiles) {
-				outputFile := fmt.Sprintf("merged_%d.tsv", i/2)
-				wg.Add(1)
-				go func(f1, f2, out string) {
-					defer wg.Done()
-					s.mergeSortedFiles([]string{f1, f2}, out)
-					mergeChan <- out
-				}(tempFiles[i], tempFiles[i+1], outputFile)
+				outputFile := fmt.Sprintf("merged_%d.tsv", outFileCounter) //i/2)
+				outFileCounter++
+				//wg.Add(1)
+				out := outputFile
+				f1 := tempFiles[i]
+				f2 := tempFiles[i+1]
+				//go func(f1, f2, out string) {
+				//	defer wg.Done()
+				err := s.mergeSortedFiles([]string{f1, f2}, out)
+				if err != nil {
+					s.log.Error("Merge failed", zap.Error(err))
+
+				}
+				mergeChan <- out
+				//}(tempFiles[i], tempFiles[i+1], outputFile)
 			} else {
 				mergeChan <- tempFiles[i] // Не с чем сливать, просто передаём дальше
 			}
@@ -383,11 +439,7 @@ func (s *Service) reduce(tempFiles []string) string {
 		tempFiles = newFiles
 	}
 
-	return tempFiles[0]
-}
-
-func (s *Service) readFirstWords() ([]string, error) {
-	return nil, nil
+	return tempFiles[0], nil
 }
 
 /*
