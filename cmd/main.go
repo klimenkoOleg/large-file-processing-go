@@ -2,23 +2,25 @@ package main
 
 import (
 	"context"
+	"log"
+	"os"
 
-	"go.uber.org/zap"
-
-	"large-file-processing-go/internal/domain/mapreduce"
+	fileAdapter "github.com/klimenkoOleg/large-file-processing-go/internal/adapter/file"
+	"github.com/klimenkoOleg/large-file-processing-go/internal/domain/mapreduce"
 )
 
 func main() {
-	l, err := zap.NewDevelopment()
-	if err != nil {
-		panic(err)
-	}
-
 	n := 2
 	workers := 1
-	service := mapreduce.NewService(n, workers, l)
-	err = service.Do(context.Background(), "input.txt")
+	storage := fileAdapter.NewStorage()
+	service := mapreduce.NewService(n, workers, storage)
+	outputFileName, err := service.Do(context.Background(), "input.txt")
 	if err != nil {
-		l.Error("service execution error", zap.Error(err))
+		log.Fatal(err)
+	}
+
+	err = os.Rename(outputFileName, "output.tsv")
+	if err != nil {
+		log.Fatal(err)
 	}
 }

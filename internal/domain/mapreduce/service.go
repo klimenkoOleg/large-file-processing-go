@@ -4,15 +4,13 @@ import (
 	"bufio"
 	"container/heap"
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"sort"
-	"strconv"
-	"strings"
 	"sync"
-
-	"go.uber.org/zap"
 )
+
+//go:generate go run github.com/vektra/mockery/v2@v2.43.2 --all
 
 type Storage interface {
 	OpenInputFile(name string) (InputFile, error)
@@ -32,164 +30,48 @@ type OutputFile interface {
 	Write(line string) error
 }
 
-type StorageImpl struct {
-	// OpenInputFile(name string) (*InputFile, error)
-	// CreateOutputFile(name string) (*OutputFile, error)
-}
-
 type Service struct {
 	n       int
 	workers int
 	storage Storage
-	log     *zap.Logger
 }
 
-func NewService(n, workers int, log *zap.Logger) *Service {
+func NewService(n, workers int, storage Storage) *Service {
 	return &Service{
 		n:       n,
 		workers: workers,
-		storage: NewStorageImpl(),
-		log:     log.Named("MapReduceService"),
+		storage: storage,
 	}
 }
 
-func NewStorageImpl() *StorageImpl {
-	return &StorageImpl{}
-}
-
-func (s *StorageImpl) OpenInputFile(name string) (InputFile, error) {
-	return newInputFile(name)
-}
-
-func (s *StorageImpl) CreateOutputFile(name string) (OutputFile, error) {
-	return newOutputFile(name)
-}
-
-type InputFileImpl struct {
-	inputFile    *os.File
-	inputScanner *bufio.Scanner
-}
-
-func newInputFile(name string) (InputFile, error) {
-	inputFile, err := os.Open(name)
-	if err != nil {
-		return nil, fmt.Errorf("newInputFile filed, error=%w", err)
-	}
-	inputScanner := bufio.NewScanner(inputFile)
-
-	return &InputFileImpl{
-		inputFile:    inputFile,
-		inputScanner: inputScanner,
-	}, nil
-}
-
-func (s *InputFileImpl) Close() error {
-	return s.inputFile.Close()
-}
-
-func (s *InputFileImpl) Scan() bool {
-	return s.inputScanner.Scan()
-}
-
-func (s *InputFileImpl) ReadLine() string {
-	return s.inputScanner.Text()
-}
-
-func (s *InputFileImpl) ReadMappedLine() (string, int, error) {
-	parts := strings.Split(s.ReadLine(), "\t")
-	word := parts[0]
-	count, err := strconv.Atoi(parts[1])
-	if err != nil {
-		return "", 0, fmt.Errorf("second part in line should be integer, but was not. Error=%w", err)
-	}
-
-	return word, count, nil
-}
-
-func (s *InputFileImpl) Err() error {
-	return s.inputScanner.Err()
-}
-
-type OutputFileImpl struct {
-	file   *os.File
-	writer *bufio.Writer
-}
-
-func newOutputFile(fileName string) (*OutputFileImpl, error) {
-	file, err := os.Create(fileName)
-	if err != nil {
-		return nil, fmt.Errorf("newOutputFile filed, error=%w", err)
-	}
-	writer := bufio.NewWriter(file)
-
-	return &OutputFileImpl{
-			file:   file,
-			writer: writer,
-		},
-		nil
-}
-
-func (s *OutputFileImpl) Close() error {
-	err := s.writer.Flush()
-	if err != nil {
-		return err
-	}
-	err = s.file.Close()
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
-func (s *OutputFileImpl) Write(line string) error {
-	//_, err := fmt.Println(s.writer, line)
-	_, err := s.writer.Write([]byte(line))
-	if err != nil {
-		return fmt.Errorf("write to file filed, error=%w", err)
-	}
-
-	return nil
-}
-
-func (s *Service) Do(ctx context.Context, inputFileName string) error {
+func (s *Service) Do(ctx context.Context, inputFileName string) (string, error) {
 	tempFiles, err := s.MapAndShuffle(ctx, inputFileName)
 	if err != nil {
-		return fmt.Errorf("map and shuffle stage failed, error=%w", err)
+		return "", fmt.Errorf("map and shuffle stage failed, error=%w", err)
 	}
 
 	outputFileName, err := s.reduce(ctx, tempFiles)
 	if err != nil {
-		return fmt.Errorf("reduce stage failed, error=%w", err)
+		return "", fmt.Errorf("reduce stage failed, error=%w", err)
 	}
 
-	err = os.Rename(outputFileName, "output.txt")
-	if err != nil {
-		return fmt.Errorf("rename output file failed, error=%w", err)
-	}
-
-	return nil
+	return outputFileName, nil
 }
 
-func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) ([]string, error) {
-	const (
-		tmpFilePrefix    = "tmp"
-		tmpFileExtension = "txt" // without dot!
-	)
-
+func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) (tempFiles []string, err error) {
 	inputFile, err := s.storage.OpenInputFile(inputFileName)
 	if err != nil {
 		return nil, fmt.Errorf("open input file failed, error=%w", err)
 	}
 	defer func() {
 		if err := inputFile.Close(); err != nil {
-			s.log.Error("Faiuled to close input", zap.Error(err)) // do not send out error, just log it
+			errors.Join(err, fmt.Errorf("failed to close input. Err=%w", err))
 		}
 	}()
 
 	wordCount := make(map[string]int)
 	fileIndex := 0
-	tempFiles := []string{}
+	//tempFiles := []string{}
 
 	for inputFile.Scan() {
 		select {
@@ -228,8 +110,8 @@ func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) ([]st
 	return tempFiles, nil
 }
 
-func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[string]int, fileIndex int) (string, error) {
-	tempFileName := fmt.Sprintf("temp_%d.tsv", fileIndex)
+func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[string]int, fileIndex int) (tempFileName string, err error) {
+	tempFileName = fmt.Sprintf("temp_%d.tsv", fileIndex)
 	// file, err := os.Create(tempFileName)
 	// if err != nil {
 	// return "", fmt.Errorf("create temp file failed, error=%w", err)
@@ -243,17 +125,16 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 	defer func() {
 		closeErr := writer.Close()
 		if closeErr != nil {
-			s.log.Error("Close temp file failed", zap.Error(err))
+			err = errors.Join(fmt.Errorf("close temp file failed, err=%w", err))
 		}
 	}()
-	// writer := bufio.NewWriter(file)
 
 	// Сортируем слова перед записью
 	words := make([]string, 0, len(wordCount))
 	for word := range wordCount {
 		words = append(words, word)
 	}
-	sort.Strings(words) // Лексикографическая сортировка, TODO: it requires extra space!
+	sortInPlace(&words)
 
 	// Записываем в файл
 	for _, word := range words {
@@ -271,6 +152,7 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 
 	return tempFileName, nil
 }
+
 func processChunk(lines []string, fileIndex int, wg *sync.WaitGroup, tempFiles chan string) {
 	defer wg.Done()
 
@@ -289,7 +171,7 @@ func processChunk(lines []string, fileIndex int, wg *sync.WaitGroup, tempFiles c
 	for word := range wordCount {
 		words = append(words, word)
 	}
-	sort.Strings(words)
+	sortInPlace(&words)
 
 	for _, word := range words {
 		fmt.Fprintf(writer, "%s\t%d\n", word, wordCount[word])
@@ -305,7 +187,7 @@ func (s *Service) openReadFiles(tempFiles []string) ([]InputFile, error) {
 	for i, f := range tempFiles {
 		inF, err := s.storage.OpenInputFile(f)
 		if err != nil {
-			return nil, fmt.Errorf("Failed to open files in storage", zap.Error(err))
+			return nil, fmt.Errorf("failed to open files in storage, err=%w", err)
 		}
 		res[i] = inF
 	}
@@ -313,28 +195,28 @@ func (s *Service) openReadFiles(tempFiles []string) ([]InputFile, error) {
 	return res, nil
 }
 
-func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error {
+func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) (err error) {
 	files, err := s.openReadFiles(tempFiles)
 	if err != nil {
-		return fmt.Errorf("Failed to open files in storage", zap.Error(err))
+		return fmt.Errorf("failed to open files in storage, err=%w", err)
 	}
 	defer func() {
 		for _, f := range files {
 			closeErr := f.Close()
 			if closeErr != nil {
-				s.log.Error("Failed to close file", zap.Error(closeErr))
+				err = errors.Join(err, fmt.Errorf("failed to close file, err=%w", closeErr))
 			}
 		}
 	}()
 
 	writer, err := s.storage.CreateOutputFile(outputFile)
 	if err != nil {
-		return fmt.Errorf("Failed to create output file in storage", zap.Error(err))
+		return fmt.Errorf("failed to create output file in storage, err=%w", err)
 	}
 	defer func() {
 		closeErr := writer.Close()
 		if closeErr != nil {
-			s.log.Error("failed to close output file", zap.Error(closeErr))
+			err = errors.Join(err, fmt.Errorf("failed to close output file, err=%w", closeErr))
 		}
 	}()
 
@@ -345,7 +227,7 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 		if f.Scan() {
 			word, count, err := f.ReadMappedLine()
 			if err != nil {
-				return fmt.Errorf("Failed to read mapped line from file in storage", zap.Error(err))
+				return fmt.Errorf("failed to read mapped line from file in storage, err=%w", err)
 			}
 			heap.Push(minHeap, WordEntry{word: word, count: count, fileIndex: i})
 		}
@@ -397,12 +279,15 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) error 
 }
 
 func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error) {
+	if len(tempFiles) == 0 {
+		return "", fmt.Errorf("nothing to reduce")
+	}
+	outFileCounter := 0
 	for len(tempFiles) > 1 {
 		var newFiles []string
-		var wg sync.WaitGroup
-		mergeChan := make(chan string, len(tempFiles)/2)
+		//var wg sync.WaitGroup
+		mergeChan := make(chan string, len(tempFiles)/2+1)
 
-		outFileCounter := 0
 		for i := 0; i < len(tempFiles); i += 2 {
 			select {
 			case <-ctx.Done():
@@ -420,7 +305,7 @@ func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error
 				//	defer wg.Done()
 				err := s.mergeSortedFiles([]string{f1, f2}, out)
 				if err != nil {
-					s.log.Error("Merge failed", zap.Error(err))
+					return "", fmt.Errorf("merge failed, err=%w", err)
 
 				}
 				mergeChan <- out
@@ -429,7 +314,7 @@ func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error
 				mergeChan <- tempFiles[i] // Не с чем сливать, просто передаём дальше
 			}
 		}
-		wg.Wait()
+		//wg.Wait()
 		close(mergeChan)
 
 		for file := range mergeChan {
@@ -441,43 +326,3 @@ func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error
 
 	return tempFiles[0], nil
 }
-
-/*
-
-	var lines []string
-	var wg sync.WaitGroup
-	tempFiles := make(chan string, s.workers)
-	fileIndex := 0
-
-	// Запуск пула горутин
-	for inputFile.Scan() {
-		lines = append(lines, inputFile.ReadLine())
-		if len(lines) >= s.n {
-			wg.Add(1)
-			go processChunk(lines, fileIndex, &wg, tempFiles)
-			fileIndex++
-			lines = nil
-		}
-	}
-
-	// Последний блок
-	if len(lines) > 0 {
-		wg.Add(1)
-		go processChunk(lines, fileIndex, &wg, tempFiles)
-	}
-
-	go func() {
-		wg.Wait()
-		close(tempFiles)
-	}()
-
-	// Собираем список файлов
-	var tempFileList []string
-	for file := range tempFiles {
-		tempFileList = append(tempFileList, file)
-	}
-
-	fmt.Println("Созданы файлы:", tempFileList)
-
-	return tempFileList, nil*/
-//}
