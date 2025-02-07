@@ -1,13 +1,12 @@
 package mapreduce
 
 import (
-	"bufio"
 	"container/heap"
 	"context"
 	"errors"
 	"fmt"
-	"os"
-	"sync"
+
+	"golang.org/x/sync/errgroup"
 )
 
 //go:generate go run github.com/vektra/mockery/v2@v2.43.2 --all
@@ -71,7 +70,6 @@ func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) (temp
 
 	wordCount := make(map[string]int)
 	fileIndex := 0
-	//tempFiles := []string{}
 
 	for inputFile.Scan() {
 		select {
@@ -112,12 +110,6 @@ func (s *Service) MapAndShuffle(ctx context.Context, inputFileName string) (temp
 
 func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[string]int, fileIndex int) (tempFileName string, err error) {
 	tempFileName = fmt.Sprintf("temp_%d.tsv", fileIndex)
-	// file, err := os.Create(tempFileName)
-	// if err != nil {
-	// return "", fmt.Errorf("create temp file failed, error=%w", err)
-	// }
-	// defer file.Close()
-
 	writer, err := s.storage.CreateOutputFile(tempFileName)
 	if err != nil {
 		return "", fmt.Errorf("create temp file failed, error=%w", err)
@@ -129,14 +121,14 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 		}
 	}()
 
-	// Сортируем слова перед записью
+	// we don't duplicate words here, since string is just a pointer to char/rune array
 	words := make([]string, 0, len(wordCount))
 	for word := range wordCount {
 		words = append(words, word)
 	}
 	sortInPlace(&words)
 
-	// Записываем в файл
+	// flush to file
 	for _, word := range words {
 		select {
 		case <-ctx.Done():
@@ -151,35 +143,6 @@ func (s *Service) shuffleAndSendToWorker(ctx context.Context, wordCount map[stri
 	}
 
 	return tempFileName, nil
-}
-
-func processChunk(lines []string, fileIndex int, wg *sync.WaitGroup, tempFiles chan string) {
-	defer wg.Done()
-
-	wordCount := make(map[string]int)
-	for _, line := range lines {
-		wordCount[line]++
-	}
-
-	// Сортируем и записываем во временный файл
-	tempFileName := fmt.Sprintf("temp_%d.tsv", fileIndex)
-	file, _ := os.Create(tempFileName)
-	defer file.Close()
-	writer := bufio.NewWriter(file)
-
-	words := make([]string, 0, len(wordCount))
-	for word := range wordCount {
-		words = append(words, word)
-	}
-	sortInPlace(&words)
-
-	for _, word := range words {
-		fmt.Fprintf(writer, "%s\t%d\n", word, wordCount[word])
-	}
-	writer.Flush()
-
-	// Отправляем название файла в канал
-	tempFiles <- tempFileName
 }
 
 func (s *Service) openReadFiles(tempFiles []string) ([]InputFile, error) {
@@ -253,25 +216,23 @@ func (s *Service) mergeSortedFiles(tempFiles []string, outputFile string) (err e
 			totalCount = entry.count
 		}
 
-		// Читаем следующую строку из того же файла
+		// Read work from the same file
 		f := files[entry.fileIndex]
 		if f.Scan() {
-			//parts := strings.Split(scanners[entry.fileIndex].Text(), "\t")
-			//count, _ := strconv.Atoi(parts[1])
 			word, count, err := f.ReadMappedLine()
 			if err != nil {
-				return fmt.Errorf("ReadMappedLine failed, error=%w", err)
+				return fmt.Errorf("call ReadMappedLine failed, error=%w", err)
 			}
 			heap.Push(minHeap, WordEntry{word: word, count: count, fileIndex: entry.fileIndex})
 		}
 	}
 
-	// Записываем последнее слово
+	// Write last word
 	if prevWord != "" {
 		line := fmt.Sprintf("%s\t%d\n", prevWord, totalCount)
 		err := writer.Write(line)
 		if err != nil {
-			return fmt.Errorf("Write failed, error=%w", err)
+			return fmt.Errorf("write failed, error=%w", err)
 		}
 	}
 
@@ -285,7 +246,7 @@ func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error
 	outFileCounter := 0
 	for len(tempFiles) > 1 {
 		var newFiles []string
-		//var wg sync.WaitGroup
+		eg := &errgroup.Group{}
 		mergeChan := make(chan string, len(tempFiles)/2+1)
 
 		for i := 0; i < len(tempFiles); i += 2 {
@@ -298,24 +259,31 @@ func (s *Service) reduce(ctx context.Context, tempFiles []string) (string, error
 				outputFile := fmt.Sprintf("merged_%d.tsv", outFileCounter) //i/2)
 				outFileCounter++
 				//wg.Add(1)
-				out := outputFile
-				f1 := tempFiles[i]
-				f2 := tempFiles[i+1]
-				//go func(f1, f2, out string) {
-				//	defer wg.Done()
-				err := s.mergeSortedFiles([]string{f1, f2}, out)
-				if err != nil {
-					return "", fmt.Errorf("merge failed, err=%w", err)
+				//out := outputFile
+				//f1 := tempFiles[i]
+				//f2 := tempFiles[i+1]
+				func(f1, f2, out string) {
+					eg.Go(func() error {
+						//defer wg.Done()
+						err := s.mergeSortedFiles([]string{f1, f2}, out)
+						if err != nil {
+							return fmt.Errorf("merge failed, err=%w", err)
+						}
+						mergeChan <- out
 
-				}
-				mergeChan <- out
-				//}(tempFiles[i], tempFiles[i+1], outputFile)
+						return nil
+					})
+				}(tempFiles[i], tempFiles[i+1], outputFile)
 			} else {
-				mergeChan <- tempFiles[i] // Не с чем сливать, просто передаём дальше
+				mergeChan <- tempFiles[i] // one left, done need to merge, pass it to the next merge iteration
 			}
 		}
-		//wg.Wait()
-		close(mergeChan)
+
+		err := eg.Wait()
+		if err != nil {
+			return "", err // it's ok not to close channel, it'll be GC'ed.
+		}
+		close(mergeChan) // here we have to close channel to notify reciever below to exot range loop.
 
 		for file := range mergeChan {
 			newFiles = append(newFiles, file)

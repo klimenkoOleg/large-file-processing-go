@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"flag"
 	"log"
 	"os"
 
@@ -10,10 +11,11 @@ import (
 )
 
 func main() {
-	n := 2
+	n := flag.Int("N", 2, "an int")
+	//n := 2
 	workers := 1
 	storage := fileAdapter.NewStorage()
-	service := mapreduce.NewService(n, workers, storage)
+	service := mapreduce.NewService(*n, workers, storage)
 	outputFileName, err := service.Do(context.Background(), "input.txt")
 	if err != nil {
 		log.Fatal(err)

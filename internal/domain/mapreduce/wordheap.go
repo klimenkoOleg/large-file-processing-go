@@ -12,7 +12,6 @@ type WordEntry struct {
 // min-heap data structure
 type WordHeap []WordEntry
 
-// TODO: use optimization - create array size of N right in the constructor, add Clear method
 func newWordHeap() *WordHeap {
 	minHeap := &WordHeap{}
 	heap.Init(minHeap)
